@@ -91,6 +91,43 @@ def create_patient(data):
         return cursor.lastrowid
 
 
+def bulk_create_patients(records):
+    """Insert multiple validated patient records in a single SQLite transaction."""
+    with get_connection() as conn:
+        inserted_ids = []
+        for data in records:
+            cursor = conn.execute("""
+                INSERT INTO patients (
+                    full_name,
+                    dob,
+                    email,
+                    glucose,
+                    haemoglobin,
+                    cholesterol,
+                    remarks,
+                    record_source,
+                    validation_status,
+                    validation_errors,
+                    ai_analyzed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                data["full_name"],
+                data["dob"],
+                data["email"],
+                float(data["glucose"]),
+                float(data["haemoglobin"]),
+                float(data["cholesterol"]),
+                data.get("remarks", ""),
+                data.get("record_source", "Bulk Import"),
+                data.get("validation_status", "Valid"),
+                data.get("validation_errors", ""),
+                data.get("ai_analyzed_at", ""),
+            ))
+            inserted_ids.append(cursor.lastrowid)
+        return inserted_ids
+
+
 def get_all_patients():
     with get_connection() as conn:
         cursor = conn.execute("""

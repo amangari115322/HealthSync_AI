@@ -7,6 +7,7 @@ import streamlit as st
 from ai_service import generate_health_insights, is_ai_configured
 from config import APP_NAME, APP_VERSION
 from database import (
+    bulk_create_patients,
     create_patient,
     delete_patient,
     get_ai_analyses_for_patient,
@@ -24,10 +25,14 @@ from database import (
 from styles import SVG_ICONS, get_image_base64, inject_design_system, render_html
 from validators import (
     ASSIGNMENT_DATASET,
+    BULK_FIELD_SPECS,
     analyze_name_and_email_duplicates,
+    auto_map_columns,
     compute_duplicate_keys,
     evaluate_record_quality,
+    suggest_correction_for_errors,
     validate_blood_values,
+    validate_bulk_dataframe,
     validate_dob,
     validate_email_address,
     validate_name,
@@ -51,14 +56,21 @@ if "current_page" not in st.session_state:
 if "add_form_nonce" not in st.session_state:
     st.session_state.add_form_nonce = 0
 if "records_subview" not in st.session_state:
-    st.session_state.records_subview = "Registry & CRUD"
+    st.session_state.records_subview = "Patient Registry"
+if "add_subview" not in st.session_state:
+    st.session_state.add_subview = "Single Patient"
+if "registry_page" not in st.session_state:
+    st.session_state.registry_page = 1
 
 
 def navigate_to(page_name: str, subview: str | None = None) -> None:
     """Update the active workspace page and rerun."""
     st.session_state.current_page = page_name
     if subview:
-        st.session_state.records_subview = subview
+        if page_name == "Add Patient":
+            st.session_state.add_subview = subview
+        else:
+            st.session_state.records_subview = subview
     st.rerun()
 
 
@@ -74,6 +86,144 @@ def refresh_all_quality() -> list[dict]:
             rec["validation_status"] = status
             rec["validation_errors"] = reasons_str
     return records
+
+
+def render_bulk_import_view(existing_patients: list[dict]) -> None:
+    """Render the CSV/Excel bulk patient upload, column mapping, and validation workflow."""
+    render_html(
+        """
+        <div class="hs-panel-card">
+            <div class="hs-panel-title">Bulk Patient Upload (CSV & Excel .xlsx)</div>
+            <div style="font-size:13.5px; line-height:1.6; color:#475569;">
+                Upload your own patient dataset in <b>CSV</b> or <b>Excel (.xlsx)</b> format.
+                Expected fields are <b>Full Name</b>, <b>DOB</b>, <b>Email</b>, <b>Glucose</b>,
+                <b>Haemoglobin</b>, and <b>Cholesterol</b>. If your file uses different column headers
+                (e.g. <code>Name</code>, <code>Date of Birth</code>, <code>Hb</code>), map them below before importing.
+            </div>
+        </div>
+        """
+    )
+
+    sample_csv = (
+        "Full Name,DOB,Email,Glucose,Haemoglobin,Cholesterol\n"
+        "Neha Verma,14/05/1991,neha.verma@example.com,98,13.8,175\n"
+        "Rohan Mehta,22/09/1985,rohan.mehta@example.com,112,14.6,205\n"
+    )
+    st.download_button(
+        "Download Sample CSV Template",
+        data=sample_csv,
+        file_name="healthsync_bulk_template.csv",
+        mime="text/csv",
+        icon=":material/download:",
+    )
+
+    uploaded_file = st.file_uploader(
+        "Choose a CSV or Excel (.xlsx) file",
+        type=["csv", "xlsx"],
+        key="bulk_file_uploader",
+    )
+
+    if uploaded_file is not None:
+        try:
+            if uploaded_file.name.lower().endswith(".csv"):
+                raw_df = pd.read_csv(uploaded_file)
+            else:
+                raw_df = pd.read_excel(uploaded_file)
+        except Exception as exc:
+            st.error(f"Could not read the uploaded file: {exc}")
+            raw_df = None
+
+        if raw_df is not None:
+            if raw_df.empty:
+                st.warning("The uploaded file contains 0 rows.")
+            else:
+                st.success(f"Loaded **{len(raw_df)}** row(s) and **{len(raw_df.columns)}** column(s) from `{uploaded_file.name}`.")
+
+                with st.expander("Raw Uploaded File Preview (First 10 Rows)", expanded=False):
+                    st.dataframe(raw_df.head(10), use_container_width=True, hide_index=True)
+
+                st.markdown("### Step 1: Map File Columns")
+                st.caption("Match each required HealthSync AI field to the corresponding column in your uploaded file.")
+
+                file_cols = list(raw_df.columns)
+                auto_map = auto_map_columns(file_cols)
+                select_options = ["— Not Mapped —"] + [str(c) for c in file_cols]
+
+                column_mapping = {}
+                m_left, m_right = st.columns(2)
+                for idx, (field_key, label, desc) in enumerate(BULK_FIELD_SPECS):
+                    target_col = m_left if idx < 3 else m_right
+                    default_col = auto_map.get(field_key)
+                    default_idx = select_options.index(default_col) if default_col in select_options else 0
+                    with target_col:
+                        chosen = st.selectbox(
+                            f"{label} *",
+                            select_options,
+                            index=default_idx,
+                            help=desc,
+                            key=f"map_{field_key}",
+                        )
+                        column_mapping[field_key] = None if chosen == "— Not Mapped —" else chosen
+
+                missing_mappings = [label for fk, label, _ in BULK_FIELD_SPECS if not column_mapping.get(fk)]
+                if missing_mappings:
+                    st.warning(f"Please map all required fields before validating: {', '.join(missing_mappings)}.")
+                else:
+                    valid_rows, invalid_rows, preview_rows = validate_bulk_dataframe(raw_df, column_mapping, existing_patients)
+
+                    st.markdown("### Step 2: Validation Preview")
+                    s1, s2, s3 = st.columns(3)
+                    with s1:
+                        render_html(f'<div class="hs-metric-card"><div class="hs-metric-label">Total Rows</div><div class="hs-metric-value" style="margin-top:8px;">{len(preview_rows)}</div></div>')
+                    with s2:
+                        render_html(f'<div class="hs-metric-card"><div class="hs-metric-label">Valid Rows Ready to Import</div><div class="hs-metric-value" style="margin-top:8px;color:#059669;">{len(valid_rows)}</div></div>')
+                    with s3:
+                        render_html(f'<div class="hs-metric-card"><div class="hs-metric-label">Rows with Errors / Duplicates</div><div class="hs-metric-value" style="margin-top:8px;color:#DC2626;">{len(invalid_rows)}</div></div>')
+
+                    render_html("<div style='height: 10px;'></div>")
+
+                    preview_df = pd.DataFrame(
+                        [
+                            {
+                                "Row": r["row_num"],
+                                "Full Name": r["full_name"],
+                                "DOB": r["dob"],
+                                "Email": r["email"],
+                                "Glucose": r["glucose"],
+                                "Haemoglobin": r["haemoglobin"],
+                                "Cholesterol": r["cholesterol"],
+                                "Validation": r["status"],
+                                "Error Details": r["errors"] or "—",
+                            }
+                            for r in preview_rows
+                        ]
+                    )
+                    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+                    if invalid_rows:
+                        with st.expander(f"Review {len(invalid_rows)} Invalid / Duplicate Row(s)", expanded=True):
+                            for err_row in invalid_rows:
+                                st.error(f"**Row {err_row['row_num']} ({err_row['full_name'] or 'Missing Name'}):** {err_row['errors']}")
+
+                    st.markdown("### Step 3: Import Valid Records")
+                    if not valid_rows:
+                        st.warning("No valid rows are available to import. Please fix the errors in your file and re-upload.")
+                    else:
+                        confirm_bulk = st.checkbox(
+                            f"I confirm importing {len(valid_rows)} valid record(s) into SQLite (invalid/duplicate rows will be skipped without modifying original data).",
+                            key="confirm_bulk_import_box",
+                        )
+                        if st.button(
+                            f"Import {len(valid_rows)} Valid Record(s)",
+                            icon=":material/cloud_upload:",
+                            type="primary",
+                            disabled=not confirm_bulk,
+                            key="btn_execute_bulk_import",
+                        ):
+                            bulk_create_patients(valid_rows)
+                            refresh_all_quality()
+                            st.success(f"Successfully imported {len(valid_rows)} valid patient record(s) into SQLite.")
+                            st.rerun()
 
 
 # ---------------- DESIGN SYSTEM ----------------
@@ -240,7 +390,7 @@ if page == "Overview":
             navigate_to("Add Patient")
     with cta_col2:
         if st.button("View Patient Records", icon=":material/folder_shared:", type="secondary", use_container_width=True, key="hero_records"):
-            navigate_to("Patient Records", "Registry & CRUD")
+            navigate_to("Patient Records", "Patient Registry")
     with cta_col3:
         if st.button("AI Health Insights", icon=":material/neurology:", type="secondary", use_container_width=True, key="hero_ai"):
             navigate_to("AI Health Insights")
@@ -365,7 +515,7 @@ if page == "Overview":
                 """
             )
             if st.button("Open Patient Records", key="ws_patients", use_container_width=True):
-                navigate_to("Patient Records", "Registry & CRUD")
+                navigate_to("Patient Records", "Patient Registry")
 
         with w2:
             render_html(
@@ -422,7 +572,7 @@ if page == "Overview":
                 """
             )
             if st.button("Open Data Quality", key="ws_quality", use_container_width=True):
-                navigate_to("Patient Records", "Data Quality & Assignment Import")
+                navigate_to("Patient Records", "Data Quality")
 
     with right_col:
         render_html(
@@ -551,6 +701,7 @@ if page == "Overview":
         with c_right:
             src_series = df_all["record_source"].fillna("Manual")
             n_manual = int((src_series == "Manual").sum())
+            n_bulk = int((src_series == "Bulk Import").sum())
             n_import = int((src_series == "Assignment Import").sum())
             render_html(
                 f"""
@@ -558,10 +709,8 @@ if page == "Overview":
                     <div class="hs-panel-title" style="margin-bottom:4px;">Record Source Overview</div>
                     <div style="font-size:12.5px;color:#64748B;margin-bottom:16px;">Origin of patient entries in SQLite</div>
                     {_bar_row("Manual Registration", n_manual, total_n, "#0D9488")}
+                    {_bar_row("Bulk Import (CSV / Excel)", n_bulk, total_n, "#0891B2")}
                     {_bar_row("Assignment Import", n_import, total_n, "#1E3A5F")}
-                    <div style="font-size:12px;color:#64748B;margin-top:8px;">
-                        Total active records: <b style="color:#0B192C;">{total_n}</b>
-                    </div>
                 </div>
                 """
             )
@@ -599,7 +748,7 @@ if page == "Overview":
                 """
             )
             if st.button("Manage & Delete Duplicates", icon=":material/content_copy:", key="ov_manage_dups", use_container_width=True):
-                navigate_to("Patient Records", "Data Quality & Assignment Import")
+                navigate_to("Patient Records", "Duplicate Review")
 
         with impact_col:
             render_html(
@@ -623,7 +772,7 @@ if page == "Overview":
         # Row 2: 3 Biomarker Distribution Cards (Altair with unique #ID labels — no duplicate stacking)
         chart_df = df_all.sort_values("id").copy()
         chart_df["record_label"] = chart_df.apply(
-            lambda r: f"#{r['id']} {str(r['full_name']).split()[0]}", axis=1
+            lambda r: f"{str(r['full_name']).split()[0]} (ID {r['id']})", axis=1
         )
 
         def _biomarker_card(col_container, field: str, title: str, subtitle: str, bar_color: str) -> None:
@@ -687,134 +836,161 @@ elif page == "Add Patient":
         """
         <div class="hs-page-header">
             <h1 class="hs-page-title">Add Patient</h1>
-            <p class="hs-page-sub">Register a new patient profile with strict validation. Date of birth is stored in DD/MM/YYYY format.</p>
+            <p class="hs-page-sub">Register a single patient profile or bulk upload multiple records via CSV / Excel.</p>
         </div>
         """
     )
 
-    nonce = st.session_state.add_form_nonce
+    ADD_VIEWS = [
+        ("Single Patient", ":material/person_add:"),
+        ("Bulk Import (CSV / Excel)", ":material/upload_file:"),
+    ]
+    if st.session_state.add_subview not in [v[0] for v in ADD_VIEWS]:
+        st.session_state.add_subview = "Single Patient"
 
-    with st.form(f"add_patient_form_{nonce}"):
-        c1, c2 = st.columns(2)
-        with c1:
-            full_name = st.text_input(
-                "Full Name *",
-                placeholder="e.g. Aarav Sharma",
-                help="Required. Minimum 2 characters.",
-            )
-            dob_value = st.date_input(
-                "Date of Birth (DD/MM/YYYY) *",
-                value=date(1992, 1, 15),
-                min_value=date(1900, 1, 1),
-                max_value=date.today(),
-                format="DD/MM/YYYY",
-                help="Select a valid date in DD/MM/YYYY format (cannot be in the future).",
-            )
-            email = st.text_input(
-                "Email Address *",
-                placeholder="e.g. aarav@example.com",
-                help="Required. Must be a valid email address.",
-            )
+    add_cols = st.columns([1.2, 1.5, 3.3])
+    for idx, (av_name, av_icon) in enumerate(ADD_VIEWS):
+        is_curr = st.session_state.add_subview == av_name
+        with add_cols[idx]:
+            if st.button(
+                av_name,
+                icon=av_icon,
+                key=f"add_view_{av_name}",
+                type="primary" if is_curr else "secondary",
+                use_container_width=True,
+            ):
+                if not is_curr:
+                    st.session_state.add_subview = av_name
+                    st.rerun()
 
-        with c2:
-            glucose = st.number_input(
-                "Glucose *",
-                min_value=0.0,
-                value=95.0,
-                step=0.5,
-                help="Numeric value greater than zero.",
-            )
-            haemoglobin = st.number_input(
-                "Haemoglobin *",
-                min_value=0.0,
-                value=14.0,
-                step=0.1,
-                help="Numeric value greater than zero.",
-            )
-            cholesterol = st.number_input(
-                "Cholesterol *",
-                min_value=0.0,
-                value=180.0,
-                step=1.0,
-                help="Numeric value greater than zero.",
-            )
+    render_html("<div style='height: 10px;'></div>")
 
-        notes = st.text_area(
-            "Initial Clinical Notes (Optional)",
-            placeholder="Optional notes...",
-            height=85,
-        )
-        auto_ai = st.checkbox(
-            "Generate AI Health Remarks automatically upon registration",
-            value=is_ai_configured(),
-            help="Calls the configured AI API to populate the Remarks field when registering a valid patient.",
-        )
+    if st.session_state.add_subview == "Bulk Import (CSV / Excel)":
+        render_bulk_import_view(refresh_all_quality())
+    else:
+        nonce = st.session_state.add_form_nonce
 
-        btn_col1, btn_col2, _ = st.columns([1.3, 1.0, 2.7])
-        submitted = btn_col1.form_submit_button("Register Patient", type="primary", use_container_width=True)
-        reset_clicked = btn_col2.form_submit_button("Reset Form", use_container_width=True)
-
-        if reset_clicked:
-            st.session_state.add_form_nonce += 1
-            st.rerun()
-
-        if submitted:
-            dob_str = dob_value.strftime("%d/%m/%Y") if dob_value else ""
-            patient_data = {
-                "full_name": full_name.strip(),
-                "dob": dob_str,
-                "email": email.strip(),
-                "glucose": glucose,
-                "haemoglobin": haemoglobin,
-                "cholesterol": cholesterol,
-                "remarks": notes.strip(),
-                "record_source": "Manual",
-            }
-
-            is_valid, error = validate_patient(patient_data)
-            if not is_valid:
-                st.error(f"Validation Error: {error}")
-            else:
-                existing = get_all_patients()
-                email_match = next(
-                    (p for p in existing if p["email"].strip().lower() == patient_data["email"].lower()),
-                    None,
+        with st.form(f"add_patient_form_{nonce}"):
+            c1, c2 = st.columns(2)
+            with c1:
+                full_name = st.text_input(
+                    "Full Name *",
+                    placeholder="e.g. Aarav Sharma",
+                    help="Required. Minimum 2 characters.",
                 )
-                name_match = next(
-                    (p for p in existing if p["full_name"].strip().lower() == patient_data["full_name"].lower()),
-                    None,
+                dob_value = st.date_input(
+                    "Date of Birth (DD/MM/YYYY) *",
+                    value=date(1992, 1, 15),
+                    min_value=date(1900, 1, 1),
+                    max_value=date.today(),
+                    format="DD/MM/YYYY",
+                    help="Select a valid date in DD/MM/YYYY format (cannot be in the future).",
                 )
-                if email_match:
-                    st.error(
-                        f"This email address (`{patient_data['email']}`) already exists in the registry "
-                        f"(Record #{email_match['id']} — {email_match['full_name']}). "
-                        "Duplicate emails can cause patient notification mix-ups and fragmented records."
-                    )
-                elif name_match:
-                    st.error(
-                        f"A patient with the name `{patient_data['full_name']}` already exists in the registry "
-                        f"(Record #{name_match['id']} — {name_match['email']}). "
-                        "Duplicate names can cause clinical record confusion and skewed analytics."
-                    )
+                email = st.text_input(
+                    "Email Address *",
+                    placeholder="e.g. aarav@example.com",
+                    help="Required. Must be a valid email address.",
+                )
+
+            with c2:
+                glucose = st.number_input(
+                    "Glucose *",
+                    min_value=0.0,
+                    value=95.0,
+                    step=0.5,
+                    help="Numeric value greater than zero.",
+                )
+                haemoglobin = st.number_input(
+                    "Haemoglobin *",
+                    min_value=0.0,
+                    value=14.0,
+                    step=0.1,
+                    help="Numeric value greater than zero.",
+                )
+                cholesterol = st.number_input(
+                    "Cholesterol *",
+                    min_value=0.0,
+                    value=180.0,
+                    step=1.0,
+                    help="Numeric value greater than zero.",
+                )
+
+            notes = st.text_area(
+                "Initial Clinical Notes (Optional)",
+                placeholder="Optional notes...",
+                height=85,
+            )
+            auto_ai = st.checkbox(
+                "Generate AI Health Remarks automatically upon registration",
+                value=is_ai_configured(),
+                help="Calls the configured AI API to populate the Remarks field when registering a valid patient.",
+            )
+
+            btn_col1, btn_col2, _ = st.columns([1.3, 1.0, 2.7])
+            submitted = btn_col1.form_submit_button("Register Patient", type="primary", use_container_width=True)
+            reset_clicked = btn_col2.form_submit_button("Reset Form", use_container_width=True)
+
+            if reset_clicked:
+                st.session_state.add_form_nonce += 1
+                st.rerun()
+
+            if submitted:
+                dob_str = dob_value.strftime("%d/%m/%Y") if dob_value else ""
+                patient_data = {
+                    "full_name": full_name.strip(),
+                    "dob": dob_str,
+                    "email": email.strip(),
+                    "glucose": glucose,
+                    "haemoglobin": haemoglobin,
+                    "cholesterol": cholesterol,
+                    "remarks": notes.strip(),
+                    "record_source": "Manual",
+                }
+
+                is_valid, error = validate_patient(patient_data)
+                if not is_valid:
+                    st.error(f"Validation Error: {error}")
                 else:
-                    ai_result = None
-                    if auto_ai:
-                        with st.spinner("Generating AI health remarks..."):
-                            ai_result = generate_health_insights(patient_data)
-                        if ai_result["ok"]:
-                            patient_data["remarks"] = ai_result["content"]
-
-                    new_id = create_patient(patient_data)
-                    if ai_result and ai_result["ok"]:
-                        save_ai_analysis(new_id, ai_result["content"], ai_result.get("model", ""))
-                    elif auto_ai and ai_result and not ai_result["ok"]:
-                        st.warning(f"Patient saved, but AI remarks could not be generated: {ai_result['error']}")
-
-                    refresh_all_quality()
-                    st.success(
-                        f"Patient '{patient_data['full_name']}' registered successfully "
-                        f"(Record ID #{new_id}, DOB {dob_str})."
+                    existing = get_all_patients()
+                    email_match = next(
+                        (p for p in existing if p["email"].strip().lower() == patient_data["email"].lower()),
+                        None,
                     )
+                    name_match = next(
+                        (p for p in existing if p["full_name"].strip().lower() == patient_data["full_name"].lower()),
+                        None,
+                    )
+                    if email_match:
+                        st.error(
+                            f"This email address (`{patient_data['email']}`) already exists in the registry "
+                            f"(Record ID {email_match['id']} — {email_match['full_name']}). "
+                            "Duplicate emails can cause patient notification mix-ups and fragmented records."
+                        )
+                    elif name_match:
+                        st.error(
+                            f"A patient with the name `{patient_data['full_name']}` already exists in the registry "
+                            f"(Record ID {name_match['id']} — {name_match['email']}). "
+                            "Duplicate names can cause clinical record confusion and skewed analytics."
+                        )
+                    else:
+                        ai_result = None
+                        if auto_ai:
+                            with st.spinner("Generating AI health remarks..."):
+                                ai_result = generate_health_insights(patient_data)
+                            if ai_result["ok"]:
+                                patient_data["remarks"] = ai_result["content"]
+
+                        new_id = create_patient(patient_data)
+                        if ai_result and ai_result["ok"]:
+                            save_ai_analysis(new_id, ai_result["content"], ai_result.get("model", ""))
+                        elif auto_ai and ai_result and not ai_result["ok"]:
+                            st.warning(f"Patient saved, but AI remarks could not be generated: {ai_result['error']}")
+
+                        refresh_all_quality()
+                        st.success(
+                            f"Patient '{patient_data['full_name']}' registered successfully "
+                            f"(Record ID {new_id}, DOB {dob_str})."
+                        )
 
 
 # ---------------- PATIENT RECORDS ----------------
@@ -824,61 +1000,101 @@ elif page == "Patient Records":
         """
         <div class="hs-page-header">
             <h1 class="hs-page-title">Patient Records</h1>
-            <p class="hs-page-sub">Complete SQLite CRUD management, data quality auditing, and assignment dataset import.</p>
+            <p class="hs-page-sub">Manage patient records, bulk CSV/Excel uploads, data quality, duplicates, and the assignment dataset.</p>
         </div>
         """
     )
 
-    subview = st.radio(
-        "Section View",
-        ["Registry & CRUD", "Data Quality & Assignment Import"],
-        index=0 if st.session_state.records_subview == "Registry & CRUD" else 1,
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-    st.session_state.records_subview = subview
+    RECORDS_VIEWS = [
+        ("Patient Registry", ":material/table_view:"),
+        ("Data Quality", ":material/fact_check:"),
+        ("Duplicate Review", ":material/content_copy:"),
+        ("Assignment Dataset", ":material/dataset:"),
+    ]
+    valid_view_names = [v[0] for v in RECORDS_VIEWS]
+    if st.session_state.records_subview not in valid_view_names:
+        st.session_state.records_subview = "Patient Registry"
 
+    nav_cols = st.columns(len(RECORDS_VIEWS))
+    for idx, (view_name, view_icon) in enumerate(RECORDS_VIEWS):
+        is_current = st.session_state.records_subview == view_name
+        with nav_cols[idx]:
+            if st.button(
+                view_name,
+                icon=view_icon,
+                key=f"rec_view_{view_name}",
+                type="primary" if is_current else "secondary",
+                use_container_width=True,
+            ):
+                if not is_current:
+                    st.session_state.records_subview = view_name
+                    st.rerun()
+
+    render_html("<div style='height: 10px;'></div>")
+
+    subview = st.session_state.records_subview
     patients = refresh_all_quality()
 
-    if subview == "Registry & CRUD":
+    # ==================== 1. PATIENT REGISTRY ====================
+    if subview == "Patient Registry":
         if not patients:
-            st.info("No patient records found in SQLite. Register a patient or switch to 'Data Quality & Assignment Import' to load the 10 assignment records.")
-            c1, c2, _ = st.columns([1.2, 1.8, 3.0])
+            st.info("No patient records found in SQLite yet. Add a single patient, upload a CSV/Excel file, or import the assignment dataset.")
+            c1, c2, c3, _ = st.columns([1.2, 1.4, 1.6, 1.8])
             with c1:
-                if st.button("Add Patient", icon=":material/person_add:", type="primary", use_container_width=True):
-                    navigate_to("Add Patient")
+                if st.button("Add Patient", icon=":material/person_add:", type="primary", use_container_width=True, key="reg_empty_add"):
+                    navigate_to("Add Patient", "Single Patient")
             with c2:
-                if st.button("Go to Assignment Import", icon=":material/upload_file:", use_container_width=True):
-                    navigate_to("Patient Records", "Data Quality & Assignment Import")
+                if st.button("Bulk Import", icon=":material/upload_file:", use_container_width=True, key="reg_empty_bulk"):
+                    navigate_to("Add Patient", "Bulk Import (CSV / Excel)")
+            with c3:
+                if st.button("Assignment Dataset", icon=":material/dataset:", use_container_width=True, key="reg_empty_assign"):
+                    navigate_to("Patient Records", "Assignment Dataset")
         else:
-            f1, f2, f3, f4, f5 = st.columns([2.2, 1.2, 1.2, 1.2, 0.8])
+            f1, f2, f3, f4, f5 = st.columns([2.2, 1.1, 1.2, 1.2, 0.8])
             with f1:
                 search_query = st.text_input(
                     "Search",
                     placeholder="Search by Name, Email, or Record ID...",
                     label_visibility="collapsed",
+                    key="reg_search",
                 )
             with f2:
                 quality_filter = st.selectbox(
-                    "Quality",
-                    ["All Quality", "Valid", "Needs Review", "Invalid"],
+                    "Status",
+                    ["All Status", "Valid", "Needs Review", "Invalid"],
                     label_visibility="collapsed",
+                    key="reg_quality_filter",
                 )
             with f3:
                 source_filter = st.selectbox(
                     "Source",
-                    ["All Sources", "Manual", "Assignment Import"],
+                    ["All Sources", "Manual", "Bulk Import", "Assignment Import"],
                     label_visibility="collapsed",
+                    key="reg_source_filter",
                 )
             with f4:
                 sort_option = st.selectbox(
                     "Sort",
                     ["Newest First", "Oldest First", "Name (A-Z)", "Glucose (High-Low)", "Cholesterol (High-Low)"],
                     label_visibility="collapsed",
+                    key="reg_sort",
                 )
             with f5:
-                if st.button("Refresh", icon=":material/refresh:", use_container_width=True):
-                    st.rerun()
+                def _reset_registry_filters() -> None:
+                    st.session_state["reg_search"] = ""
+                    st.session_state["reg_quality_filter"] = "All Status"
+                    st.session_state["reg_source_filter"] = "All Sources"
+                    st.session_state["reg_sort"] = "Newest First"
+                    st.session_state["reg_page_size"] = 10
+                    st.session_state["registry_page"] = 1
+
+                st.button(
+                    "Refresh",
+                    icon=":material/refresh:",
+                    use_container_width=True,
+                    key="reg_refresh",
+                    on_click=_reset_registry_filters,
+                )
 
             q = search_query.strip().lower()
             filtered = []
@@ -888,7 +1104,7 @@ elif page == "Patient Records":
                     matches_text = q in p["full_name"].lower() or q in p["email"].lower()
                     if not (matches_id or matches_text):
                         continue
-                if quality_filter != "All Quality" and p.get("validation_status") != quality_filter:
+                if quality_filter != "All Status" and p.get("validation_status") != quality_filter:
                     continue
                 if source_filter != "All Sources" and (p.get("record_source") or "Manual") != source_filter:
                     continue
@@ -903,7 +1119,30 @@ elif page == "Patient Records":
             elif sort_option == "Cholesterol (High-Low)":
                 filtered.sort(key=lambda x: float(x["cholesterol"]), reverse=True)
 
-            st.caption(f"Showing **{len(filtered)}** of **{len(patients)}** total patient record(s).")
+            # Pagination controls
+            pg_col1, pg_col2 = st.columns([3, 1])
+            with pg_col2:
+                page_size = st.selectbox(
+                    "Rows per page",
+                    [10, 25, 50],
+                    index=0,
+                    label_visibility="collapsed",
+                    key="reg_page_size",
+                )
+            total_filtered = len(filtered)
+            total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+            if st.session_state.registry_page > total_pages:
+                st.session_state.registry_page = 1
+            curr_page = st.session_state.registry_page
+            start_idx = (curr_page - 1) * page_size
+            end_idx = start_idx + page_size
+            page_rows = filtered[start_idx:end_idx]
+
+            with pg_col1:
+                st.caption(
+                    f"Showing **{len(page_rows)}** of **{total_filtered}** matching record(s) "
+                    f"(Total in SQLite: **{len(patients)}**) · Page **{curr_page}** of **{total_pages}**"
+                )
 
             if not filtered:
                 st.warning("No patient records match your current search or filter criteria.")
@@ -912,35 +1151,46 @@ elif page == "Patient Records":
                     [
                         {
                             "Record ID": p["id"],
-                            "Full Name": p["full_name"],
+                            "Name": p["full_name"],
                             "DOB": p["dob"],
                             "Email": p["email"],
                             "Glucose": p["glucose"],
                             "Haemoglobin": p["haemoglobin"],
                             "Cholesterol": p["cholesterol"],
-                            "Remarks": (p.get("remarks") or "").strip() or "—",
-                            "AI Remarks Status": "Generated" if (p.get("remarks") or "").strip() else "Pending",
-                            "Data Quality Status": p.get("validation_status", "Valid"),
+                            "Status": p.get("validation_status", "Valid"),
                             "Source": p.get("record_source", "Manual"),
-                            "Created Date": str(p.get("created_at", ""))[:19],
+                            "Remarks": (p.get("remarks") or "").strip() or "—",
                         }
-                        for p in filtered
+                        for p in page_rows
                     ]
                 )
                 st.dataframe(table_df, use_container_width=True, hide_index=True)
 
+                if total_pages > 1:
+                    p_prev, p_info, p_next, _ = st.columns([1, 1.5, 1, 3.5])
+                    with p_prev:
+                        if st.button("Previous", disabled=curr_page <= 1, key="reg_prev", use_container_width=True):
+                            st.session_state.registry_page -= 1
+                            st.rerun()
+                    with p_info:
+                        st.markdown(f"<div style='text-align:center;padding-top:8px;font-size:13px;color:#64748B;'>Page {curr_page} / {total_pages}</div>", unsafe_allow_html=True)
+                    with p_next:
+                        if st.button("Next", disabled=curr_page >= total_pages, key="reg_next", use_container_width=True):
+                            st.session_state.registry_page += 1
+                            st.rerun()
+
                 render_html("<div style='height: 12px;'></div>")
 
                 options = {
-                    f"#{p['id']} — {p['full_name']} ({p['validation_status']})": p["id"]
+                    f"ID {p['id']} — {p['full_name']} ({p.get('validation_status', 'Valid')})": p["id"]
                     for p in filtered
                 }
-                selected_label = st.selectbox("Select Patient Record for Details, Edit, or Delete", list(options.keys()))
+                selected_label = st.selectbox("Select Patient Record for Actions (View, Edit, Delete)", list(options.keys()), key="reg_action_select")
                 selected_id = options[selected_label]
                 patient = get_patient_by_id(selected_id)
 
                 if patient:
-                    tab_details, tab_edit, tab_delete = st.tabs(["Patient Details", "Edit Record", "Delete Record"])
+                    tab_details, tab_edit, tab_delete = st.tabs(["View Details", "Edit Record", "Delete Record"])
 
                     with tab_details:
                         d_left, d_right = st.columns([1.15, 1])
@@ -948,7 +1198,7 @@ elif page == "Patient Records":
                             render_html(
                                 f"""
                                 <div class="hs-panel-card">
-                                    <div class="hs-panel-title">Profile — #{patient['id']} {patient['full_name']}</div>
+                                    <div class="hs-panel-title">Profile — {patient['full_name']} (ID {patient['id']})</div>
                                     <div class="hs-spec-row"><span class="hs-spec-key">Full Name</span><span class="hs-spec-val">{patient['full_name']}</span></div>
                                     <div class="hs-spec-row"><span class="hs-spec-key">Date of Birth</span><span class="hs-spec-val">{patient['dob']}</span></div>
                                     <div class="hs-spec-row"><span class="hs-spec-key">Email</span><span class="hs-spec-val">{patient['email']}</span></div>
@@ -1034,12 +1284,12 @@ elif page == "Patient Records":
                                 else:
                                     update_patient(patient["id"], updated_data)
                                     refresh_all_quality()
-                                    st.success(f"Record #{patient['id']} ({updated_data['full_name']}) updated successfully.")
+                                    st.success(f"Record ID {patient['id']} ({updated_data['full_name']}) updated successfully.")
                                     st.rerun()
 
                     with tab_delete:
                         st.warning(
-                            f"You are about to permanently delete Record **#{patient['id']} — {patient['full_name']}** "
+                            f"You are about to permanently delete **Record ID {patient['id']} — {patient['full_name']}** "
                             f"(Email: `{patient['email']}`, DOB: `{patient['dob']}`)."
                         )
                         confirm_del = st.checkbox(
@@ -1055,11 +1305,163 @@ elif page == "Patient Records":
                         ):
                             delete_patient(patient["id"])
                             refresh_all_quality()
-                            st.success(f"Patient record #{patient['id']} deleted successfully.")
+                            st.success(f"Patient record ID {patient['id']} deleted successfully.")
                             st.rerun()
 
-    else:
-        # Data Quality & Assignment Import Subview
+    # ==================== 2. DATA QUALITY ====================
+    elif subview == "Data Quality":
+        total_n = len(patients)
+        n_valid = sum(1 for p in patients if p.get("validation_status") == "Valid")
+        n_review = sum(1 for p in patients if p.get("validation_status") == "Needs Review")
+        n_invalid = sum(1 for p in patients if p.get("validation_status") == "Invalid")
+
+        q1, q2, q3, q4 = st.columns(4)
+        with q1:
+            render_html(f'<div class="hs-metric-card"><div class="hs-metric-label">Total Records</div><div class="hs-metric-value" style="margin-top:8px;">{total_n}</div></div>')
+        with q2:
+            render_html(f'<div class="hs-metric-card"><div class="hs-metric-label">Valid</div><div class="hs-metric-value" style="margin-top:8px;color:#059669;">{n_valid}</div></div>')
+        with q3:
+            render_html(f'<div class="hs-metric-card"><div class="hs-metric-label">Needs Review</div><div class="hs-metric-value" style="margin-top:8px;color:#D97706;">{n_review}</div></div>')
+        with q4:
+            render_html(f'<div class="hs-metric-card"><div class="hs-metric-label">Invalid</div><div class="hs-metric-value" style="margin-top:8px;color:#DC2626;">{n_invalid}</div></div>')
+
+        render_html("<div style='height: 14px;'></div>")
+
+        if not patients:
+            st.info("No records in SQLite yet.")
+        else:
+            issues = [p for p in patients if p.get("validation_status") in ("Invalid", "Needs Review")]
+            if not issues:
+                st.success("All patient records currently in SQLite passed validation checks.")
+            else:
+                audit_df = pd.DataFrame(
+                    [
+                        {
+                            "Record ID": p["id"],
+                            "Full Name": p["full_name"],
+                            "DOB": p["dob"],
+                            "Email": p["email"],
+                            "Source": p.get("record_source", "Manual"),
+                            "Status": p.get("validation_status"),
+                            "Detected Errors": p.get("validation_errors"),
+                            "Suggested Correction": suggest_correction_for_errors(p.get("validation_errors", "")),
+                        }
+                        for p in issues
+                    ]
+                )
+                st.dataframe(audit_df, use_container_width=True, hide_index=True)
+
+                st.markdown("### Review & Fix Invalid Record")
+                fix_options = {
+                    f"ID {p['id']} — {p['full_name']} [{p.get('validation_status')}]": p["id"]
+                    for p in issues
+                }
+                selected_fix_label = st.selectbox("Select a flagged record to correct and revalidate", list(fix_options.keys()), key="dq_fix_select")
+                fix_id = fix_options[selected_fix_label]
+                fix_rec = get_patient_by_id(fix_id)
+
+                if fix_rec:
+                    st.warning(f"**Detected Issue(s):** {fix_rec.get('validation_errors')}")
+                    st.info(f"**Suggested Correction:** {suggest_correction_for_errors(fix_rec.get('validation_errors', ''))}")
+
+                    with st.form(f"dq_fix_form_{fix_rec['id']}"):
+                        fc1, fc2 = st.columns(2)
+                        with fc1:
+                            fx_name = st.text_input("Full Name *", value=fix_rec["full_name"])
+                            fx_dob = st.text_input("Date of Birth (DD/MM/YYYY) *", value=fix_rec["dob"])
+                            fx_email = st.text_input("Email Address *", value=fix_rec["email"])
+                        with fc2:
+                            fx_glucose = st.number_input("Glucose *", min_value=0.0, value=float(fix_rec["glucose"]), step=0.5)
+                            fx_hb = st.number_input("Haemoglobin *", min_value=0.0, value=float(fix_rec["haemoglobin"]), step=0.1)
+                            fx_chol = st.number_input("Cholesterol *", min_value=0.0, value=float(fix_rec["cholesterol"]), step=1.0)
+
+                        if st.form_submit_button("Save & Revalidate", type="primary"):
+                            updated = {
+                                "full_name": fx_name.strip(),
+                                "dob": fx_dob.strip(),
+                                "email": fx_email.strip(),
+                                "glucose": fx_glucose,
+                                "haemoglobin": fx_hb,
+                                "cholesterol": fx_chol,
+                                "remarks": fix_rec.get("remarks", ""),
+                            }
+                            update_patient(fix_rec["id"], updated)
+                            refresh_all_quality()
+                            refreshed = get_patient_by_id(fix_rec["id"])
+                            if refreshed and refreshed.get("validation_status") == "Valid":
+                                st.success(f"Record ID {fix_rec['id']} saved and revalidated as **Valid**.")
+                            else:
+                                st.warning(
+                                    f"Record ID {fix_rec['id']} saved, but still flagged as "
+                                    f"**{refreshed.get('validation_status')}**: {refreshed.get('validation_errors')}"
+                                )
+                            st.rerun()
+
+    # ==================== 4. DUPLICATE REVIEW ====================
+    elif subview == "Duplicate Review":
+        dup_info = analyze_name_and_email_duplicates(patients)
+        flagged_dups = dup_info["flagged_records"]
+
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            render_html(f'<div class="hs-metric-card"><div class="hs-metric-label">Duplicate Name Records</div><div class="hs-metric-value" style="margin-top:8px;">{dup_info["duplicate_name_records"]}</div></div>')
+        with d2:
+            render_html(f'<div class="hs-metric-card"><div class="hs-metric-label">Duplicate Email Records</div><div class="hs-metric-value" style="margin-top:8px;">{dup_info["duplicate_email_records"]}</div></div>')
+        with d3:
+            render_html(f'<div class="hs-metric-card"><div class="hs-metric-label">Total Flagged</div><div class="hs-metric-value" style="margin-top:8px;">{len(flagged_dups)}</div></div>')
+
+        render_html("<div style='height: 14px;'></div>")
+
+        if not flagged_dups:
+            st.success("No duplicate patient names or duplicate email addresses found.")
+        else:
+            st.warning(
+                "Keeping duplicate patient names or email addresses can cause clinical record mix-ups, "
+                "skewed biomarker analytics, and notification delivery errors."
+            )
+            dup_df = pd.DataFrame(
+                [
+                    {
+                        "Record ID": r["id"],
+                        "Full Name": r["full_name"],
+                        "Email": r["email"],
+                        "DOB": r["dob"],
+                        "Source": r.get("record_source", "Manual"),
+                        "Duplicate Type": r["duplicate_reason"],
+                    }
+                    for r in flagged_dups
+                ]
+            )
+            st.dataframe(dup_df, use_container_width=True, hide_index=True)
+
+            dup_options = {
+                f"ID {r['id']} — {r['full_name']} ({r['email']}) [{r['duplicate_reason']}]": r["id"]
+                for r in flagged_dups
+            }
+            selected_dup_label = st.selectbox(
+                "Select Duplicate Record to Delete",
+                list(dup_options.keys()),
+                key="dup_delete_select",
+            )
+            selected_dup_id = dup_options[selected_dup_label]
+            confirm_dup_del = st.checkbox(
+                f"I confirm deleting duplicate Record ID {selected_dup_id} from SQLite.",
+                key="confirm_dup_del_box",
+            )
+            if st.button(
+                "Delete Selected Duplicate",
+                icon=":material/delete:",
+                type="primary",
+                disabled=not confirm_dup_del,
+                key="btn_delete_dup",
+            ):
+                delete_patient(selected_dup_id)
+                refresh_all_quality()
+                st.success(f"Duplicate Record ID {selected_dup_id} deleted successfully.")
+                st.rerun()
+
+    # ==================== 5. ASSIGNMENT DATASET ====================
+    elif subview == "Assignment Dataset":
         already_imported = has_assignment_dataset()
 
         render_html(
@@ -1126,100 +1528,6 @@ elif page == "Patient Records":
                 st.success("Assignment dataset reset and re-imported cleanly.")
                 st.rerun()
 
-        render_html(
-            """
-            <div class="hs-section-header">
-                <h2 class="hs-section-title">Data Quality & Validation Report</h2>
-                <span class="hs-section-sub">Detected issues across all SQLite records</span>
-            </div>
-            """
-        )
-
-        if not patients:
-            st.info("No records in SQLite yet.")
-        else:
-            issues = [p for p in patients if p.get("validation_status") in ("Invalid", "Needs Review")]
-            if not issues:
-                st.success("All patient records currently in SQLite are Valid.")
-            else:
-                audit_df = pd.DataFrame(
-                    [
-                        {
-                            "Record ID": p["id"],
-                            "Full Name": p["full_name"],
-                            "DOB": p["dob"],
-                            "Email": p["email"],
-                            "Source": p.get("record_source", "Manual"),
-                            "Status": p.get("validation_status"),
-                            "Detected Issues": p.get("validation_errors"),
-                        }
-                        for p in issues
-                    ]
-                )
-                st.dataframe(audit_df, use_container_width=True, hide_index=True)
-
-        # Duplicate Name & Email Manager (View & Delete)
-        render_html(
-            """
-            <div class="hs-section-header">
-                <h2 class="hs-section-title">Duplicate Name & Email Manager</h2>
-                <span class="hs-section-sub">Inspect and remove duplicate patient entries</span>
-            </div>
-            """
-        )
-
-        dup_info = analyze_name_and_email_duplicates(patients)
-        flagged_dups = dup_info["flagged_records"]
-
-        if not flagged_dups:
-            st.success("No duplicate patient names or duplicate email addresses found.")
-        else:
-            st.warning(
-                f"Detected **{dup_info['duplicate_name_records']}** record(s) with duplicate names and "
-                f"**{dup_info['duplicate_email_records']}** record(s) with duplicate emails. "
-                "Keeping duplicates can cause clinical record mix-ups and distort analytics."
-            )
-            dup_df = pd.DataFrame(
-                [
-                    {
-                        "Record ID": r["id"],
-                        "Full Name": r["full_name"],
-                        "Email": r["email"],
-                        "DOB": r["dob"],
-                        "Source": r.get("record_source", "Manual"),
-                        "Duplicate Type": r["duplicate_reason"],
-                    }
-                    for r in flagged_dups
-                ]
-            )
-            st.dataframe(dup_df, use_container_width=True, hide_index=True)
-
-            dup_options = {
-                f"#{r['id']} — {r['full_name']} ({r['email']}) [{r['duplicate_reason']}]": r["id"]
-                for r in flagged_dups
-            }
-            selected_dup_label = st.selectbox(
-                "Select Duplicate Record to Delete",
-                list(dup_options.keys()),
-                key="dup_delete_select",
-            )
-            selected_dup_id = dup_options[selected_dup_label]
-            confirm_dup_del = st.checkbox(
-                f"I confirm deleting duplicate Record #{selected_dup_id} from SQLite.",
-                key="confirm_dup_del_box",
-            )
-            if st.button(
-                "Delete Selected Duplicate",
-                icon=":material/delete:",
-                type="primary",
-                disabled=not confirm_dup_del,
-                key="btn_delete_dup",
-            ):
-                delete_patient(selected_dup_id)
-                refresh_all_quality()
-                st.success(f"Duplicate Record #{selected_dup_id} deleted successfully.")
-                st.rerun()
-
 
 # ---------------- AI HEALTH INSIGHTS ----------------
 
@@ -1249,9 +1557,9 @@ elif page == "AI Health Insights":
                 navigate_to("Add Patient")
         with c2:
             if st.button("Import Assignment Data", icon=":material/upload_file:", use_container_width=True):
-                navigate_to("Patient Records", "Data Quality & Assignment Import")
+                navigate_to("Patient Records", "Assignment Dataset")
     else:
-        options = {f"#{p['id']} — {p['full_name']} ({p['email']})": p for p in patients}
+        options = {f"ID {p['id']} — {p['full_name']} ({p['email']})": p for p in patients}
         selected_key = st.selectbox("Select Patient", list(options.keys()))
         selected_patient = options[selected_key]
 
@@ -1259,7 +1567,7 @@ elif page == "AI Health Insights":
         render_html(
             f"""
             <div class="hs-panel-card">
-                <div class="hs-panel-title">Patient Summary — #{selected_patient['id']} {selected_patient['full_name']}</div>
+                <div class="hs-panel-title">Patient Summary — {selected_patient['full_name']} (ID {selected_patient['id']})</div>
                 <div class="hs-spec-row"><span class="hs-spec-key">Date of Birth</span><span class="hs-spec-val">{selected_patient['dob']}</span></div>
                 <div class="hs-spec-row"><span class="hs-spec-key">Email</span><span class="hs-spec-val">{selected_patient['email']}</span></div>
                 <div class="hs-spec-row"><span class="hs-spec-key">Data Quality Status</span><span class="hs-spec-val">{selected_patient.get('validation_status', 'Valid')}</span></div>

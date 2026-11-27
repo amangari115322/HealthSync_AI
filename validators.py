@@ -1,5 +1,6 @@
 from collections import Counter
 from datetime import datetime, date
+import math
 from email_validator import validate_email, EmailNotValidError
 
 
@@ -266,3 +267,186 @@ def analyze_name_and_email_duplicates(records):
         "duplicate_email_records": sum(1 for r in records if str(r.get("email", "")).strip().lower() in dup_emails),
         "flagged_records": flagged,
     }
+
+
+BULK_FIELD_SPECS = [
+    ("full_name", "Full Name", "Patient full name (min. 2 characters)"),
+    ("dob", "DOB", "Date of birth (DD/MM/YYYY or DD.MM.YYYY, not in future)"),
+    ("email", "Email", "Valid email address (e.g. patient@example.com)"),
+    ("glucose", "Glucose", "Numeric value > 0"),
+    ("haemoglobin", "Haemoglobin", "Numeric value > 0"),
+    ("cholesterol", "Cholesterol", "Numeric value > 0"),
+]
+
+_COLUMN_ALIASES = {
+    "full_name": {"full name", "fullname", "name", "patient name", "patient", "full_name"},
+    "dob": {"dob", "date of birth", "dateofbirth", "birth date", "birthdate", "date_of_birth"},
+    "email": {"email", "email address", "email id", "e-mail", "mail", "email_address"},
+    "glucose": {"glucose", "blood glucose", "sugar", "fasting glucose", "glucose level"},
+    "haemoglobin": {"haemoglobin", "hemoglobin", "hb", "hgb", "hb level"},
+    "cholesterol": {"cholesterol", "total cholesterol", "chol", "cholesterol level"},
+}
+
+
+def auto_map_columns(uploaded_columns):
+    """Best-effort mapping from uploaded file headers to HealthSync AI patient fields."""
+    normalized = {str(col).strip().lower().replace("_", " "): str(col) for col in uploaded_columns}
+    mapping = {}
+    used_cols = set()
+
+    for field_key, _, _ in BULK_FIELD_SPECS:
+        aliases = _COLUMN_ALIASES[field_key]
+        matched = None
+        for norm_col, orig_col in normalized.items():
+            if norm_col in aliases and orig_col not in used_cols:
+                matched = orig_col
+                break
+        mapping[field_key] = matched
+        if matched:
+            used_cols.add(matched)
+
+    return mapping
+
+
+def _is_missing(val):
+    if val is None:
+        return True
+    if isinstance(val, float) and math.isnan(val):
+        return True
+    text = str(val).strip()
+    return text == "" or text.lower() in ("nan", "none", "nat")
+
+
+def _format_cell_text(val):
+    if _is_missing(val):
+        return ""
+    return str(val).strip()
+
+
+def _format_dob_cell(val):
+    if _is_missing(val):
+        return ""
+    if isinstance(val, (datetime, date)):
+        return val.strftime("%d/%m/%Y")
+    return str(val).strip()
+
+
+def validate_bulk_dataframe(df, column_mapping, existing_records):
+    """
+    Validate all rows of an uploaded DataFrame using column_mapping without mutating original values.
+    Returns (valid_rows, invalid_rows, preview_rows).
+    """
+    existing_emails = {
+        str(r.get("email", "")).strip().lower()
+        for r in existing_records
+        if str(r.get("email", "")).strip()
+    }
+    existing_names = {
+        str(r.get("full_name", "")).strip().lower()
+        for r in existing_records
+        if str(r.get("full_name", "")).strip()
+    }
+
+    seen_file_emails = set()
+    seen_file_names = set()
+
+    valid_rows = []
+    invalid_rows = []
+    preview_rows = []
+
+    for idx, row in df.iterrows():
+        row_num = idx + 1
+        raw_name = _format_cell_text(row[column_mapping["full_name"]]) if column_mapping.get("full_name") else ""
+        raw_dob = _format_dob_cell(row[column_mapping["dob"]]) if column_mapping.get("dob") else ""
+        raw_email = _format_cell_text(row[column_mapping["email"]]) if column_mapping.get("email") else ""
+        raw_glucose = row[column_mapping["glucose"]] if column_mapping.get("glucose") else None
+        raw_hb = row[column_mapping["haemoglobin"]] if column_mapping.get("haemoglobin") else None
+        raw_chol = row[column_mapping["cholesterol"]] if column_mapping.get("cholesterol") else None
+
+        errors = []
+
+        ok_name, err_name = validate_name(raw_name)
+        if not ok_name:
+            errors.append(err_name)
+
+        ok_email, err_email = validate_email_address(raw_email)
+        if not ok_email:
+            errors.append(err_email)
+
+        ok_dob, err_dob = validate_dob(raw_dob, allow_dot_format=True)
+        if not ok_dob:
+            errors.append(err_dob)
+
+        g_val = None if _is_missing(raw_glucose) else raw_glucose
+        h_val = None if _is_missing(raw_hb) else raw_hb
+        c_val = None if _is_missing(raw_chol) else raw_chol
+        ok_blood, err_blood = validate_blood_values(g_val, h_val, c_val)
+        if not ok_blood:
+            errors.append(err_blood)
+
+        name_key = raw_name.lower()
+        email_key = raw_email.lower()
+
+        if email_key and (email_key in existing_emails or email_key in seen_file_emails):
+            errors.append(
+                "Duplicate email detected (already exists in database or earlier in this file)."
+            )
+        if name_key and (name_key in existing_names or name_key in seen_file_names):
+            errors.append(
+                "Duplicate name detected (already exists in database or earlier in this file)."
+            )
+
+        status = "Valid" if not errors else "Invalid"
+        record_payload = {
+            "row_num": row_num,
+            "full_name": raw_name,
+            "dob": raw_dob,
+            "email": raw_email,
+            "glucose": "" if _is_missing(raw_glucose) else raw_glucose,
+            "haemoglobin": "" if _is_missing(raw_hb) else raw_hb,
+            "cholesterol": "" if _is_missing(raw_chol) else raw_chol,
+            "status": status,
+            "errors": "; ".join(errors),
+        }
+
+        preview_rows.append(record_payload)
+        if not errors:
+            seen_file_emails.add(email_key)
+            seen_file_names.add(name_key)
+            valid_rows.append(
+                {
+                    "full_name": raw_name,
+                    "dob": raw_dob,
+                    "email": raw_email,
+                    "glucose": float(raw_glucose),
+                    "haemoglobin": float(raw_hb),
+                    "cholesterol": float(raw_chol),
+                    "remarks": "",
+                    "record_source": "Bulk Import",
+                    "validation_status": "Valid",
+                    "validation_errors": "",
+                }
+            )
+        else:
+            invalid_rows.append(record_payload)
+
+    return valid_rows, invalid_rows, preview_rows
+
+
+def suggest_correction_for_errors(errors_text):
+    """Return human-readable suggested corrections for validation error strings."""
+    text = (errors_text or "").lower()
+    suggestions = []
+    if "email" in text:
+        suggestions.append("Update to a valid email format (e.g. name@domain.com).")
+    if "future" in text:
+        suggestions.append("Correct the birth year so DOB is not in the future.")
+    if "date" in text:
+        suggestions.append("Use a valid calendar date in DD/MM/YYYY format.")
+    if "greater than zero" in text or "numeric" in text:
+        suggestions.append("Enter positive numeric lab values (> 0).")
+    if "duplicate" in text:
+        suggestions.append("Review in Duplicate Review and remove or merge redundant entries.")
+    if not suggestions:
+        suggestions.append("Verify all required fields are complete and properly formatted.")
+    return " ".join(suggestions)
